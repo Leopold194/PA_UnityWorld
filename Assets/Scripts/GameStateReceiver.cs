@@ -1,4 +1,5 @@
 using UnityEngine;
+using System.Collections.Generic;
 
 [System.Serializable]
 public class WorldState { public ulong tick; public EntityState ball; public PlayerState[] players; }
@@ -34,6 +35,44 @@ public class GameStateReceiver : MonoBehaviour
     [Header("Doit matcher tick_duration côté Rust")]
     public float receiveInterval = 1f / 60f;
 
+    [Header("Mode jouer : joueurs humains")]
+    [Tooltip("Indices (dans currentState.players[]) des joueurs contrôlés par un humain en mode jouer. " +
+             "À renseigner selon votre mapping lobby/manette (ex: 0 pour le joueur local). " +
+             "Peut aussi être défini au runtime via SetHumanPlayers().")]
+    public int[] humanPlayerIndices = new int[0];
+
+    [Header("Halo de tir (joueurs humains)")]
+    [Tooltip("Couleur du halo qui apparaît autour d'un joueur humain quand il tire.")]
+    public Color haloColor = new Color(1f, 0.85f, 0.15f, 0.9f);
+    [Tooltip("Durée de l'animation du halo (expansion + fondu).")]
+    public float haloDuration = 0.35f;
+    [Tooltip("Épaisseur du trait du halo.")]
+    public float haloLineWidth = 0.08f;
+    [Tooltip("Hauteur au sol à laquelle le halo est dessiné.")]
+    public float haloHeight = 0.03f;
+    [Tooltip("Nombre de segments du cercle du halo.")]
+    public int haloSegments = 40;
+    [Tooltip("Marge par rapport au rayon du joueur pour le rayon de départ du halo.")]
+    public float haloStartRadiusMultiplier = 1.1f;
+
+    [Header("Flèche façon FIFA (joueurs humains)")]
+    [Tooltip("Couleur de la petite flèche affichée au-dessus des joueurs humains.")]
+    public Color arrowColor = new Color(1f, 0.9f, 0.1f, 1f);
+    [Tooltip("Hauteur de la flèche au-dessus du joueur.")]
+    public float arrowHeightAbovePlayer = 2.2f;
+    [Tooltip("Amplitude du léger mouvement de flottement de la flèche.")]
+    public float arrowBobAmplitude = 0.15f;
+    [Tooltip("Vitesse du flottement de la flèche.")]
+    public float arrowBobSpeed = 4f;
+    [Tooltip("Taille (demi-largeur/hauteur) de la flèche.")]
+    public float arrowSize = 0.35f;
+
+    // Valeurs reprises de continuous_football_env.rs (Rust) pour que les effets
+    // visuels restent cohérents avec les valeurs réelles de la simulation :
+    // PLAYER_RADIUS = 55.0, KICK_RADIUS = 120.0 (unités du terrain Rust, à multiplier par worldScale).
+    const float RustPlayerRadius = 55f;
+    const float RustKickRadius = 120f;
+
     WorldState currentState;
     WorldState previousState;
     float lastReceiveTime;
@@ -45,12 +84,24 @@ public class GameStateReceiver : MonoBehaviour
     float[] dashStretchTimers;
     Vector3[] baseScales;
 
+    HashSet<int> humanPlayerSet;
+    LineRenderer[] haloRenderers;
+    float[] haloTimers;
+    Transform[] arrowTransforms;
+
     bool spawned = false;
 
     void OnEnable()
     {
         Debug.Log("[GameStateReceiver] OnEnable / abonnement");
+        humanPlayerSet = new HashSet<int>(humanPlayerIndices);
         GameNetworkClient.Instance.OnWorldState += HandleWorldState;
+    }
+
+    public void SetHumanPlayers(IEnumerable<int> indices)
+    {
+        humanPlayerSet = new HashSet<int>(indices);
+        if (playerTransforms != null) RebuildHumanVisuals(playerTransforms.Length);
     }
     void OnDisable() { if (GameNetworkClient.Instance != null) GameNetworkClient.Instance.OnWorldState -= HandleWorldState; }
 
@@ -91,6 +142,92 @@ public class GameStateReceiver : MonoBehaviour
             playerTransforms[i].name = $"Player_{i}_{(players[i].team == 0 ? "Slime" : "TurtleShell")}";
             playerAnimators[i] = playerTransforms[i].GetComponentInChildren<Animator>();
             baseScales[i] = playerTransforms[i].localScale;
+        }
+
+        RebuildHumanVisuals(n);
+    }
+
+    void RebuildHumanVisuals(int n)
+    {
+        if (haloRenderers != null)
+            foreach (var lr in haloRenderers)
+                if (lr != null) Destroy(lr.gameObject);
+        if (arrowTransforms != null)
+            foreach (var arr in arrowTransforms)
+                if (arr != null) Destroy(arr.gameObject);
+
+        haloRenderers = new LineRenderer[n];
+        haloTimers = new float[n];
+        arrowTransforms = new Transform[n];
+
+        for (int i = 0; i < n; i++)
+        {
+            if (humanPlayerSet == null || !humanPlayerSet.Contains(i)) continue;
+            haloRenderers[i] = CreateHalo(i);
+            arrowTransforms[i] = CreateArrow(i);
+        }
+    }
+
+    LineRenderer CreateHalo(int index)
+    {
+        var go = new GameObject($"HumanHalo_{index}");
+        var lr = go.AddComponent<LineRenderer>();
+        lr.loop = true;
+        lr.useWorldSpace = true;
+        lr.widthMultiplier = haloLineWidth;
+        lr.material = new Material(Shader.Find("Sprites/Default"));
+        lr.startColor = haloColor;
+        lr.endColor = haloColor;
+        lr.numCapVertices = 4;
+        lr.positionCount = haloSegments + 1;
+        lr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        lr.receiveShadows = false;
+        go.SetActive(false);
+        return lr;
+    }
+
+    Transform CreateArrow(int index)
+    {
+        var go = new GameObject($"HumanArrow_{index}");
+        var mf = go.AddComponent<MeshFilter>();
+        var mr = go.AddComponent<MeshRenderer>();
+        mf.mesh = BuildArrowMesh(arrowSize);
+        var mat = new Material(Shader.Find("Sprites/Default"));
+        mat.color = arrowColor;
+        mr.material = mat;
+        mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        mr.receiveShadows = false;
+        return go.transform;
+    }
+
+    Mesh BuildArrowMesh(float size)
+    {
+        // Petit triangle pointant vers le bas, comme le repère au-dessus du joueur contrôlé dans FIFA.
+        var mesh = new Mesh { name = "FifaArrow" };
+        Vector3[] verts =
+        {
+            new Vector3(-size, size, 0f),
+            new Vector3(size, size, 0f),
+            new Vector3(0f, -size, 0f),
+        };
+        // Deux triangles (recto/verso) pour rester visible quelle que soit l'orientation de la caméra.
+        int[] tris = { 0, 1, 2, 0, 2, 1 };
+        mesh.vertices = verts;
+        mesh.triangles = tris;
+        mesh.RecalculateNormals();
+        mesh.RecalculateBounds();
+        return mesh;
+    }
+
+    void UpdateHaloPoints(LineRenderer lr, Vector3 center, float radius)
+    {
+        int count = haloSegments + 1;
+        if (lr.positionCount != count) lr.positionCount = count;
+        for (int s = 0; s < count; s++)
+        {
+            float angle = (s / (float)haloSegments) * Mathf.PI * 2f;
+            Vector3 p = center + new Vector3(Mathf.Cos(angle) * radius, haloHeight, Mathf.Sin(angle) * radius);
+            lr.SetPosition(s, p);
         }
     }
 
@@ -156,19 +293,27 @@ public class GameStateReceiver : MonoBehaviour
         if (lookDir.sqrMagnitude > 1e-4f)
             tr.rotation = Quaternion.LookRotation(lookDir);
 
+        bool wasKicking = prev != null && prev.kick_timer != 0;
+        bool isKicking = cur.kick_timer != 0;
+
         if (anim != null)
         {
             float speed = new Vector2(cur.vx, cur.vy).magnitude;
             anim.SetFloat("Speed", speed);
 
-            bool wasKicking = prev != null && prev.kick_timer != 0;
-            bool isKicking = cur.kick_timer != 0;
             if (isKicking && !wasKicking) { anim.SetTrigger("Kick"); kickPulseTimers[index] = kickPulseDuration; }
 
             bool wasDashing = prev != null && prev.dash_timer != 0;
             bool isDashing = cur.dash_timer != 0;
             if (isDashing && !wasDashing) dashStretchTimers[index] = dashStretchDuration;
         }
+
+        // Halo de tir : uniquement pour les joueurs humains, déclenché au début du tir (front montant du kick).
+        if (isKicking && !wasKicking && humanPlayerSet != null && humanPlayerSet.Contains(index))
+            haloTimers[index] = haloDuration;
+
+        UpdateHumanHalo(index, tr.position);
+        UpdateHumanArrow(index, tr.position);
 
         if (kickPulseTimers[index] > 0f)
         {
@@ -185,5 +330,46 @@ public class GameStateReceiver : MonoBehaviour
             tr.localScale = Vector3.Scale(baseScales[index], new Vector3(squash, squash, stretch));
         }
         else tr.localScale = baseScales[index];
+    }
+
+    void UpdateHumanHalo(int index, Vector3 playerWorldPos)
+    {
+        LineRenderer lr = haloRenderers[index];
+        if (lr == null) return;
+
+        if (haloTimers[index] > 0f)
+        {
+            haloTimers[index] -= Time.deltaTime;
+            float progress = 1f - Mathf.Clamp01(haloTimers[index] / haloDuration); // 0 (début) -> 1 (fin)
+
+            float startRadius = RustPlayerRadius * worldScale * haloStartRadiusMultiplier;
+            float endRadius = RustKickRadius * worldScale;
+            float radius = Mathf.Lerp(startRadius, endRadius, progress);
+
+            Color c = haloColor;
+            c.a = haloColor.a * (1f - progress);
+            lr.startColor = c;
+            lr.endColor = c;
+
+            if (!lr.gameObject.activeSelf) lr.gameObject.SetActive(true);
+            UpdateHaloPoints(lr, playerWorldPos, radius);
+        }
+        else if (lr.gameObject.activeSelf)
+        {
+            lr.gameObject.SetActive(false);
+        }
+    }
+
+    void UpdateHumanArrow(int index, Vector3 playerWorldPos)
+    {
+        Transform arrowTr = arrowTransforms[index];
+        if (arrowTr == null) return;
+
+        float bob = Mathf.Sin(Time.time * arrowBobSpeed) * arrowBobAmplitude;
+        arrowTr.position = playerWorldPos + Vector3.up * (arrowHeightAbovePlayer + bob);
+
+        Camera cam = Camera.main;
+        if (cam != null)
+            arrowTr.rotation = Quaternion.LookRotation(arrowTr.position - cam.transform.position, Vector3.up);
     }
 }
