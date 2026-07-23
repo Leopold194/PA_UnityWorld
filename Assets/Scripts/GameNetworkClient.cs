@@ -131,10 +131,17 @@ public class GameNetworkClient : MonoBehaviour
     public void SendReady() => Send("ready", "{}");
     public void SendInput(PlayerInputMsg msg) => Send("input", JsonUtility.ToJson(msg));
 
-    void OnDestroy()
+    public void Disconnect()
     {
         running = false;
         stream?.Close();
         client?.Close();
+        stream = null;
+        client = null;
+    }
+
+    void OnDestroy()
+    {
+        Disconnect();
     }
 }

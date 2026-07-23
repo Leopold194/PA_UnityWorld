@@ -66,7 +66,7 @@ public class GameStateReceiver : MonoBehaviour
     public float arrowBobSpeed = 4f;
     [Tooltip("Taille de la flèche, exprimée en fraction de la largeur détectée du joueur (bounds du " +
              "renderer). Ex: 0.8 = flèche aussi large que 80% du joueur.")]
-    public float arrowSize = 0.8f;
+    public float arrowSize = 0.5f;
 
     // Valeurs reprises de continuous_football_env.rs (Rust) pour que les effets
     // visuels restent cohérents avec les valeurs réelles de la simulation :
@@ -110,6 +110,41 @@ public class GameStateReceiver : MonoBehaviour
     {
         humanPlayerSet = new HashSet<int>(indices);
         if (playerTransforms != null) RebuildHumanVisuals(playerTransforms.Length);
+    }
+
+    // Détruit toutes les entités instanciées pour la partie en cours (ballon, joueurs,
+    // anneaux de tir, flèches) et remet l'état à zéro, pour repartir sur une base propre
+    // au prochain game_start (ex: après un retour au menu).
+    public void ResetGame()
+    {
+        currentState = null;
+        previousState = null;
+
+        if (ballTransform != null) Destroy(ballTransform.gameObject);
+        ballTransform = null;
+        spawned = false;
+
+        if (playerTransforms != null)
+            foreach (var t in playerTransforms)
+                if (t != null) Destroy(t.gameObject);
+        if (kickRingTransforms != null)
+            foreach (var t in kickRingTransforms)
+                if (t != null) Destroy(t.gameObject);
+        if (arrowTransforms != null)
+            foreach (var t in arrowTransforms)
+                if (t != null) Destroy(t.gameObject);
+
+        playerTransforms = null;
+        playerAnimators = null;
+        kickPulseTimers = null;
+        dashStretchTimers = null;
+        baseScales = null;
+        playerHeights = null;
+        playerWidths = null;
+        kickRingTransforms = null;
+        kickRingMaterials = null;
+        haloTimers = null;
+        arrowTransforms = null;
     }
 
     void HandleGameStart(GameStartMsg msg)
@@ -286,16 +321,19 @@ public class GameStateReceiver : MonoBehaviour
         return billboardQuadMesh;
     }
 
-    // Anneau de tir : enfant du joueur (suit sa position automatiquement, pas de
-    // synchronisation manuelle), dessiné par HumanRingIndicator.shader. L'échelle du
-    // quad est fixée une fois pour couvrir le rayon max de tir ; _Radius (0-0.5,
-    // fraction du quad) est piloté depuis UpdateKickRing pour l'animation d'expansion.
+    // Anneau de tir : PAS parenté au joueur (position resynchronisée manuellement dans
+    // UpdateKickRing, comme la flèche). Un enfant hériterait de l'échelle du Transform du
+    // joueur, or celle-ci est animée pendant le kick (pulse jusqu'à kickScalePulse en
+    // 0.3s, cf ApplyPlayer) : l'anneau gonflait alors bien au-delà de son rayon réel et son
+    // animation se retrouvait mélangée à celle, plus courte, du pulse du joueur.
+    // Dessiné par HumanRingIndicator.shader ; l'échelle du quad est fixée une fois pour
+    // couvrir le rayon max de tir, _Radius (0-0.5, fraction du quad) est piloté depuis
+    // UpdateKickRing pour l'animation d'expansion.
     Transform CreateKickRing(int index, Transform parent)
     {
         var go = new GameObject($"HumanKickRing_{index}");
-        go.transform.SetParent(parent, false);
-        go.transform.localPosition = Vector3.up * haloHeight;
-        go.transform.localRotation = Quaternion.identity;
+        go.transform.position = parent.position + Vector3.up * haloHeight;
+        go.transform.rotation = Quaternion.identity;
 
         float diameter = RustKickRadius * worldScale * 2f;
         go.transform.localScale = new Vector3(diameter, 1f, diameter);
@@ -332,7 +370,7 @@ public class GameStateReceiver : MonoBehaviour
 
         float width = (playerWidths != null && index < playerWidths.Length) ? playerWidths[index] : 1f;
         float size = Mathf.Max(width * arrowSize, 0.05f);
-        go.transform.localScale = new Vector3(size, size, 1f);
+        go.transform.localScale = new Vector3(10, 10, 1f);
 
         return go.transform;
     }
@@ -349,9 +387,43 @@ public class GameStateReceiver : MonoBehaviour
         Debug.Log($"[GameStateReceiver] frame reçue, tick={state.tick}, players={state.players?.Length}");
 
         EnsureBallSpawned();
+        WorldState prevForEdges = currentState;
         previousState = currentState;
         currentState = state;
         lastReceiveTime = Time.realtimeSinceStartup;
+
+        DetectPlayerTriggers(prevForEdges, state);
+    }
+
+    // Détection des fronts montants (début de kick / dash) à chaque message reçu, plutôt que
+    // dans Update(). Le serveur peut envoyer plusieurs world_state par frame Unity (simulation
+    // plus rapide que le rendu) ; comme GameNetworkClient dépile tous les messages en attente
+    // à chaque frame, une détection dans Update() ne voit que la dernière paire prev/current du
+    // paquet et rate le front montant si un kick démarre ET se termine dans le même paquet.
+    // En détectant ici, sur CHAQUE message reçu, aucun front n'est jamais raté.
+    void DetectPlayerTriggers(WorldState prev, WorldState cur)
+    {
+        if (cur?.players == null) return;
+        if (kickPulseTimers == null || kickPulseTimers.Length != cur.players.Length) return;
+
+        for (int i = 0; i < cur.players.Length; i++)
+        {
+            bool wasKicking = prev?.players != null && i < prev.players.Length && prev.players[i].kick_timer != 0;
+            bool isKicking = cur.players[i].kick_timer != 0;
+            if (isKicking && !wasKicking)
+            {
+                kickPulseTimers[i] = kickPulseDuration;
+                if (playerAnimators != null && i < playerAnimators.Length && playerAnimators[i] != null)
+                    playerAnimators[i].SetTrigger("Kick");
+                if (humanPlayerSet != null && humanPlayerSet.Contains(i))
+                    haloTimers[i] = haloDuration;
+            }
+
+            bool wasDashing = prev?.players != null && i < prev.players.Length && prev.players[i].dash_timer != 0;
+            bool isDashing = cur.players[i].dash_timer != 0;
+            if (isDashing && !wasDashing)
+                dashStretchTimers[i] = dashStretchDuration;
+        }
     }
 
     void Update()
@@ -399,26 +471,16 @@ public class GameStateReceiver : MonoBehaviour
         if (lookDir.sqrMagnitude > 1e-4f)
             tr.rotation = Quaternion.LookRotation(lookDir);
 
-        bool wasKicking = prev != null && prev.kick_timer != 0;
-        bool isKicking = cur.kick_timer != 0;
-
         if (anim != null)
         {
             float speed = new Vector2(cur.vx, cur.vy).magnitude;
             anim.SetFloat("Speed", speed);
-
-            if (isKicking && !wasKicking) { anim.SetTrigger("Kick"); kickPulseTimers[index] = kickPulseDuration; }
-
-            bool wasDashing = prev != null && prev.dash_timer != 0;
-            bool isDashing = cur.dash_timer != 0;
-            if (isDashing && !wasDashing) dashStretchTimers[index] = dashStretchDuration;
         }
 
-        // Anneau de tir : uniquement pour les joueurs humains, déclenché au début du tir (front montant du kick).
-        if (isKicking && !wasKicking && humanPlayerSet != null && humanPlayerSet.Contains(index))
-            haloTimers[index] = haloDuration;
+        // Les triggers (kick pulse, halo, dash) sont désormais détectés message par message
+        // dans DetectPlayerTriggers, pas ici : voir HandleWorldState.
 
-        UpdateKickRing(index);
+        UpdateKickRing(index, tr.position);
         UpdateHumanArrow(index, tr.position);
 
         if (kickPulseTimers[index] > 0f)
@@ -438,11 +500,13 @@ public class GameStateReceiver : MonoBehaviour
         else tr.localScale = baseScales[index];
     }
 
-    void UpdateKickRing(int index)
+    void UpdateKickRing(int index, Vector3 playerWorldPos)
     {
         Transform ringTr = kickRingTransforms[index];
         if (ringTr == null) return;
         Material mat = kickRingMaterials[index];
+
+        ringTr.position = playerWorldPos + Vector3.up * haloHeight;
 
         if (haloTimers[index] > 0f)
         {
@@ -470,7 +534,7 @@ public class GameStateReceiver : MonoBehaviour
         Transform arrowTr = arrowTransforms[index];
         if (arrowTr == null) return;
 
-        float height = (playerHeights != null && index < playerHeights.Length) ? playerHeights[index] : 2f;
+        float height = (playerHeights != null && index < playerHeights.Length) ? playerHeights[index] + 16 : 2f;
         float bob = Mathf.Sin(Time.time * arrowBobSpeed) * arrowBobAmplitude;
         arrowTr.position = playerWorldPos + Vector3.up * (height + arrowHeightAbovePlayer + bob);
 

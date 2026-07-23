@@ -11,6 +11,11 @@ public class UIManager : MonoBehaviour
 
     public void Start()
     {
+        ShowMainMenu();
+    }
+
+    public void ShowMainMenu()
+    {
         panelMenuPrincipal.SetActive(true);
         panelVisualisation.SetActive(false);
         panelJouer.SetActive(false);

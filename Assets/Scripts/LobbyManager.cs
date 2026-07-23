@@ -17,6 +17,8 @@ public class LobbyManager : MonoBehaviour
     [Header("Suite du flow")]
     public GameObject menuCanvas;
     public GamepadInputSender inputSender;  // cf. section 6
+    public GameStateReceiver gameStateReceiver;
+    public UIManager uiManager;
 
     int myClientId = -1;
     int myTeam = -1;
@@ -94,5 +96,21 @@ public class LobbyManager : MonoBehaviour
         menuCanvas.SetActive(false);
         scorePanel.SetActive(true);
         if (inputSender != null) inputSender.enabled = true;
+    }
+
+    // Quitte la partie en cours et revient au menu principal : coupe la connexion au
+    // serveur (le protocole n'a pas de message "leave", donc on ferme simplement la
+    // socket) et détruit les entités de jeu instanciées, pour repartir sur un état propre
+    // si le joueur relance une partie ensuite.
+    public void QuitToMenu()
+    {
+        if (inputSender != null) inputSender.enabled = false;
+        gameStateReceiver?.ResetGame();
+        GameNetworkClient.Instance.Disconnect();
+
+        myClientId = -1;
+        myTeam = -1;
+
+        uiManager.ShowMainMenu();
     }
 }
