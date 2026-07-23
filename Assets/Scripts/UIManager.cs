@@ -8,6 +8,7 @@ public class UIManager : MonoBehaviour
     public GameObject panelLoading;
     public GameObject panelTeams;
     public GameObject canvasScore;
+    public GameObject canvasMenus;
 
     public void Start()
     {
@@ -16,6 +17,8 @@ public class UIManager : MonoBehaviour
 
     public void ShowMainMenu()
     {
+        Debug.Log("UIManager: ShowMainMenu");
+        canvasMenus.SetActive(true);
         panelMenuPrincipal.SetActive(true);
         panelVisualisation.SetActive(false);
         panelJouer.SetActive(false);

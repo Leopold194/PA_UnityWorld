@@ -110,7 +110,7 @@ public class LobbyManager : MonoBehaviour
 
         myClientId = -1;
         myTeam = -1;
-
+        Debug.Log("QuitToMenu: déconnexion du serveur et retour au menu principal.");
         uiManager.ShowMainMenu();
     }
 }
