@@ -2,7 +2,13 @@ using UnityEngine;
 using System.Collections.Generic;
 
 [System.Serializable]
-public class WorldState { public ulong tick; public EntityState ball; public PlayerState[] players; }
+public class WorldState {
+    public ulong tick;
+    public EntityState ball;
+    public PlayerState[] players;
+    public int team0_score;
+    public int team1_score;
+}
 [System.Serializable]
 public class EntityState { public float x, y, vx, vy; }
 [System.Serializable]
@@ -384,13 +390,15 @@ public class GameStateReceiver : MonoBehaviour
 
     void HandleWorldState(WorldState state)
     {
-        Debug.Log($"[GameStateReceiver] frame reçue, tick={state.tick}, players={state.players?.Length}");
-
+        // Debug.Log($"[GameStateReceiver] frame reçue, tick={state.tick}, players={state.players?.Length}");
+        Debug.Log($"[GameStateReceiver] frame reçue, tick={state.tick}, players={state.players?.Length}, score={state.team0_score}-{state.team1_score}");
         EnsureBallSpawned();
         WorldState prevForEdges = currentState;
         previousState = currentState;
         currentState = state;
         lastReceiveTime = Time.realtimeSinceStartup;
+
+        ScoreManager.Instance.SetScore(state.team0_score, state.team1_score);
 
         DetectPlayerTriggers(prevForEdges, state);
     }
