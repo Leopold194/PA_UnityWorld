@@ -37,35 +37,36 @@ public class GameStateReceiver : MonoBehaviour
 
     [Header("Mode jouer : joueurs humains")]
     [Tooltip("Indices (dans currentState.players[]) des joueurs contrôlés par un humain en mode jouer. " +
-             "À renseigner selon votre mapping lobby/manette (ex: 0 pour le joueur local). " +
-             "Peut aussi être défini au runtime via SetHumanPlayers().")]
+             "Renseigné automatiquement à la réception de 'game_start' depuis le serveur (lobby_server), " +
+             "qui connaît le mapping réel joueur humain/slot. Valeur ci-dessous uniquement utilisée en " +
+             "fallback (tests hors connexion) tant qu'aucun game_start n'a été reçu.")]
     public int[] humanPlayerIndices = new int[0];
 
-    [Header("Halo de tir (joueurs humains)")]
-    [Tooltip("Couleur du halo qui apparaît autour d'un joueur humain quand il tire.")]
+    [Header("Anneau de tir (joueurs humains)")]
+    [Tooltip("Couleur de l'anneau qui apparaît au sol autour d'un joueur humain quand il tire.")]
     public Color haloColor = new Color(1f, 0.85f, 0.15f, 0.9f);
-    [Tooltip("Durée de l'animation du halo (expansion + fondu).")]
+    [Tooltip("Durée de l'animation de l'anneau (expansion + fondu).")]
     public float haloDuration = 0.35f;
-    [Tooltip("Épaisseur du trait du halo.")]
+    [Tooltip("Épaisseur de l'anneau, en fraction du rayon (0-0.5).")]
     public float haloLineWidth = 0.08f;
-    [Tooltip("Hauteur au sol à laquelle le halo est dessiné.")]
+    [Tooltip("Hauteur au sol à laquelle l'anneau est dessiné (évite le z-fighting avec le sol).")]
     public float haloHeight = 0.03f;
-    [Tooltip("Nombre de segments du cercle du halo.")]
-    public int haloSegments = 40;
-    [Tooltip("Marge par rapport au rayon du joueur pour le rayon de départ du halo.")]
+    [Tooltip("Marge par rapport au rayon du joueur pour le rayon de départ de l'anneau.")]
     public float haloStartRadiusMultiplier = 1.1f;
 
     [Header("Flèche façon FIFA (joueurs humains)")]
     [Tooltip("Couleur de la petite flèche affichée au-dessus des joueurs humains.")]
     public Color arrowColor = new Color(1f, 0.9f, 0.1f, 1f);
-    [Tooltip("Hauteur de la flèche au-dessus du joueur.")]
-    public float arrowHeightAbovePlayer = 2.2f;
+    [Tooltip("Marge ajoutée au-dessus du sommet détecté du joueur (bounds du renderer), pour que la " +
+             "flèche reste juste au-dessus de la tête quelle que soit la taille réelle du prefab.")]
+    public float arrowHeightAbovePlayer = 0.4f;
     [Tooltip("Amplitude du léger mouvement de flottement de la flèche.")]
     public float arrowBobAmplitude = 0.15f;
     [Tooltip("Vitesse du flottement de la flèche.")]
     public float arrowBobSpeed = 4f;
-    [Tooltip("Taille (demi-largeur/hauteur) de la flèche.")]
-    public float arrowSize = 0.35f;
+    [Tooltip("Taille de la flèche, exprimée en fraction de la largeur détectée du joueur (bounds du " +
+             "renderer). Ex: 0.8 = flèche aussi large que 80% du joueur.")]
+    public float arrowSize = 0.8f;
 
     // Valeurs reprises de continuous_football_env.rs (Rust) pour que les effets
     // visuels restent cohérents avec les valeurs réelles de la simulation :
@@ -83,11 +84,17 @@ public class GameStateReceiver : MonoBehaviour
     float[] kickPulseTimers;
     float[] dashStretchTimers;
     Vector3[] baseScales;
+    float[] playerHeights;
+    float[] playerWidths;
 
     HashSet<int> humanPlayerSet;
-    LineRenderer[] haloRenderers;
+    Transform[] kickRingTransforms;
+    Material[] kickRingMaterials;
     float[] haloTimers;
     Transform[] arrowTransforms;
+
+    static Mesh groundQuadMesh;
+    static Mesh billboardQuadMesh;
 
     bool spawned = false;
 
@@ -96,6 +103,7 @@ public class GameStateReceiver : MonoBehaviour
         Debug.Log("[GameStateReceiver] OnEnable / abonnement");
         humanPlayerSet = new HashSet<int>(humanPlayerIndices);
         GameNetworkClient.Instance.OnWorldState += HandleWorldState;
+        GameNetworkClient.Instance.OnGameStart += HandleGameStart;
     }
 
     public void SetHumanPlayers(IEnumerable<int> indices)
@@ -103,7 +111,25 @@ public class GameStateReceiver : MonoBehaviour
         humanPlayerSet = new HashSet<int>(indices);
         if (playerTransforms != null) RebuildHumanVisuals(playerTransforms.Length);
     }
-    void OnDisable() { if (GameNetworkClient.Instance != null) GameNetworkClient.Instance.OnWorldState -= HandleWorldState; }
+
+    void HandleGameStart(GameStartMsg msg)
+    {
+        var indices = new List<int>();
+        if (msg?.slots != null)
+        {
+            for (int i = 0; i < msg.slots.Length; i++)
+                if (msg.slots[i] != -1) indices.Add(i);
+        }
+        Debug.Log($"[GameStateReceiver] game_start reçu, joueurs humains = [{string.Join(", ", indices)}]");
+        SetHumanPlayers(indices);
+    }
+
+    void OnDisable()
+    {
+        if (GameNetworkClient.Instance == null) return;
+        GameNetworkClient.Instance.OnWorldState -= HandleWorldState;
+        GameNetworkClient.Instance.OnGameStart -= HandleGameStart;
+    }
 
     void EnsureBallSpawned()
     {
@@ -134,6 +160,8 @@ public class GameStateReceiver : MonoBehaviour
         kickPulseTimers = new float[n];
         dashStretchTimers = new float[n];
         baseScales = new Vector3[n];
+        playerHeights = new float[n];
+        playerWidths = new float[n];
 
         for (int i = 0; i < n; i++)
         {
@@ -142,93 +170,171 @@ public class GameStateReceiver : MonoBehaviour
             playerTransforms[i].name = $"Player_{i}_{(players[i].team == 0 ? "Slime" : "TurtleShell")}";
             playerAnimators[i] = playerTransforms[i].GetComponentInChildren<Animator>();
             baseScales[i] = playerTransforms[i].localScale;
+
+            // Détection auto des dimensions réelles du prefab (comme autoDetectRadius pour le ballon),
+            // pour placer/dimensionner la flèche relativement à la vraie taille du personnage plutôt
+            // qu'avec des valeurs fixes qui ne correspondent à aucune échelle en particulier.
+            //
+            // On calcule à partir de sharedMesh.bounds (donnée statique de l'asset, toujours valide
+            // immédiatement) plutôt que Renderer.bounds : pour un SkinnedMeshRenderer fraîchement
+            // instancié, Renderer.bounds peut ne pas encore refléter la transformation monde réelle
+            // (recalcul lié au rendu/skinning, pas garanti synchrone avec Instantiate()).
+            //
+            // La hauteur est mesurée comme (haut réel du mesh - position du pivot), pas extents.y*2 :
+            // le pivot de ces prefabs est aux pieds, pas au centre vertical du mesh, donc extents*2
+            // sous-estimait la hauteur réelle et plaçait la flèche à mi-corps.
+            Bounds? worldBounds = ComputeRendererWorldBounds(playerTransforms[i]);
+            if (worldBounds.HasValue)
+            {
+                playerHeights[i] = worldBounds.Value.max.y - playerTransforms[i].position.y;
+                playerWidths[i] = Mathf.Max(worldBounds.Value.extents.x, worldBounds.Value.extents.z) * 2f;
+            }
+            else
+            {
+                playerHeights[i] = 2f;
+                playerWidths[i] = 1f;
+            }
         }
 
         RebuildHumanVisuals(n);
     }
 
+    // Bounds monde calculés à partir des données statiques du mesh (sharedMesh.bounds), en
+    // transformant les 8 coins via la hiérarchie de Transform réelle. Contrairement à
+    // Renderer.bounds (potentiellement pas à jour pour un SkinnedMeshRenderer venant d'être
+    // instancié), sharedMesh.bounds + TransformPoint est toujours immédiatement correct.
+    static Bounds? ComputeRendererWorldBounds(Transform root)
+    {
+        var smr = root.GetComponentInChildren<SkinnedMeshRenderer>();
+        if (smr != null && smr.sharedMesh != null)
+            return TransformLocalBounds(smr.transform, smr.sharedMesh.bounds);
+
+        var mf = root.GetComponentInChildren<MeshFilter>();
+        if (mf != null && mf.sharedMesh != null)
+            return TransformLocalBounds(mf.transform, mf.sharedMesh.bounds);
+
+        return null;
+    }
+
+    static Bounds TransformLocalBounds(Transform t, Bounds local)
+    {
+        Vector3 c = local.center;
+        Vector3 e = local.extents;
+        Bounds result = new Bounds(t.TransformPoint(c), Vector3.zero);
+        for (int xi = -1; xi <= 1; xi += 2)
+            for (int yi = -1; yi <= 1; yi += 2)
+                for (int zi = -1; zi <= 1; zi += 2)
+                    result.Encapsulate(t.TransformPoint(c + new Vector3(e.x * xi, e.y * yi, e.z * zi)));
+        return result;
+    }
+
     void RebuildHumanVisuals(int n)
     {
-        if (haloRenderers != null)
-            foreach (var lr in haloRenderers)
-                if (lr != null) Destroy(lr.gameObject);
+        if (kickRingTransforms != null)
+            foreach (var t in kickRingTransforms)
+                if (t != null) Destroy(t.gameObject);
         if (arrowTransforms != null)
             foreach (var arr in arrowTransforms)
                 if (arr != null) Destroy(arr.gameObject);
 
-        haloRenderers = new LineRenderer[n];
+        kickRingTransforms = new Transform[n];
+        kickRingMaterials = new Material[n];
         haloTimers = new float[n];
         arrowTransforms = new Transform[n];
 
         for (int i = 0; i < n; i++)
         {
             if (humanPlayerSet == null || !humanPlayerSet.Contains(i)) continue;
-            haloRenderers[i] = CreateHalo(i);
+            kickRingTransforms[i] = CreateKickRing(i, playerTransforms[i]);
             arrowTransforms[i] = CreateArrow(i);
         }
     }
 
-    LineRenderer CreateHalo(int index)
+    static Mesh GetGroundQuadMesh()
     {
-        var go = new GameObject($"HumanHalo_{index}");
-        var lr = go.AddComponent<LineRenderer>();
-        lr.loop = true;
-        lr.useWorldSpace = true;
-        lr.widthMultiplier = haloLineWidth;
-        lr.material = new Material(Shader.Find("Sprites/Default"));
-        lr.startColor = haloColor;
-        lr.endColor = haloColor;
-        lr.numCapVertices = 4;
-        lr.positionCount = haloSegments + 1;
-        lr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-        lr.receiveShadows = false;
-        go.SetActive(false);
-        return lr;
+        if (groundQuadMesh != null) return groundQuadMesh;
+        groundQuadMesh = new Mesh { name = "GroundQuad" };
+        groundQuadMesh.vertices = new[]
+        {
+            new Vector3(-0.5f, 0f, -0.5f),
+            new Vector3(0.5f, 0f, -0.5f),
+            new Vector3(0.5f, 0f, 0.5f),
+            new Vector3(-0.5f, 0f, 0.5f),
+        };
+        groundQuadMesh.uv = new[] { new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1) };
+        groundQuadMesh.triangles = new[] { 0, 1, 2, 0, 2, 3 };
+        groundQuadMesh.RecalculateNormals();
+        groundQuadMesh.RecalculateBounds();
+        return groundQuadMesh;
     }
 
+    static Mesh GetBillboardQuadMesh()
+    {
+        if (billboardQuadMesh != null) return billboardQuadMesh;
+        billboardQuadMesh = new Mesh { name = "BillboardQuad" };
+        billboardQuadMesh.vertices = new[]
+        {
+            new Vector3(-0.5f, -0.5f, 0f),
+            new Vector3(0.5f, -0.5f, 0f),
+            new Vector3(0.5f, 0.5f, 0f),
+            new Vector3(-0.5f, 0.5f, 0f),
+        };
+        billboardQuadMesh.uv = new[] { new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1) };
+        billboardQuadMesh.triangles = new[] { 0, 1, 2, 0, 2, 3 };
+        billboardQuadMesh.RecalculateNormals();
+        billboardQuadMesh.RecalculateBounds();
+        return billboardQuadMesh;
+    }
+
+    // Anneau de tir : enfant du joueur (suit sa position automatiquement, pas de
+    // synchronisation manuelle), dessiné par HumanRingIndicator.shader. L'échelle du
+    // quad est fixée une fois pour couvrir le rayon max de tir ; _Radius (0-0.5,
+    // fraction du quad) est piloté depuis UpdateKickRing pour l'animation d'expansion.
+    Transform CreateKickRing(int index, Transform parent)
+    {
+        var go = new GameObject($"HumanKickRing_{index}");
+        go.transform.SetParent(parent, false);
+        go.transform.localPosition = Vector3.up * haloHeight;
+        go.transform.localRotation = Quaternion.identity;
+
+        float diameter = RustKickRadius * worldScale * 2f;
+        go.transform.localScale = new Vector3(diameter, 1f, diameter);
+
+        var mf = go.AddComponent<MeshFilter>();
+        mf.mesh = GetGroundQuadMesh();
+        var mr = go.AddComponent<MeshRenderer>();
+        var mat = new Material(Shader.Find("Custom/HumanRingIndicator"));
+        mat.color = haloColor;
+        mr.material = mat;
+        mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        mr.receiveShadows = false;
+
+        kickRingMaterials[index] = mat;
+        go.SetActive(false);
+        return go.transform;
+    }
+
+    // Flèche façon FIFA : pas parentée au joueur (doit toujours faire face à la
+    // caméra, indépendamment de la rotation du joueur), dessinée par
+    // HumanArrowIndicator.shader. Taille/hauteur dérivées des bounds détectés du
+    // prefab (playerWidths/playerHeights) plutôt que de valeurs fixes.
     Transform CreateArrow(int index)
     {
         var go = new GameObject($"HumanArrow_{index}");
         var mf = go.AddComponent<MeshFilter>();
+        mf.mesh = GetBillboardQuadMesh();
         var mr = go.AddComponent<MeshRenderer>();
-        mf.mesh = BuildArrowMesh(arrowSize);
-        var mat = new Material(Shader.Find("Sprites/Default"));
+        var mat = new Material(Shader.Find("Custom/HumanArrowIndicator"));
         mat.color = arrowColor;
         mr.material = mat;
         mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
         mr.receiveShadows = false;
+
+        float width = (playerWidths != null && index < playerWidths.Length) ? playerWidths[index] : 1f;
+        float size = Mathf.Max(width * arrowSize, 0.05f);
+        go.transform.localScale = new Vector3(size, size, 1f);
+
         return go.transform;
-    }
-
-    Mesh BuildArrowMesh(float size)
-    {
-        // Petit triangle pointant vers le bas, comme le repère au-dessus du joueur contrôlé dans FIFA.
-        var mesh = new Mesh { name = "FifaArrow" };
-        Vector3[] verts =
-        {
-            new Vector3(-size, size, 0f),
-            new Vector3(size, size, 0f),
-            new Vector3(0f, -size, 0f),
-        };
-        // Deux triangles (recto/verso) pour rester visible quelle que soit l'orientation de la caméra.
-        int[] tris = { 0, 1, 2, 0, 2, 1 };
-        mesh.vertices = verts;
-        mesh.triangles = tris;
-        mesh.RecalculateNormals();
-        mesh.RecalculateBounds();
-        return mesh;
-    }
-
-    void UpdateHaloPoints(LineRenderer lr, Vector3 center, float radius)
-    {
-        int count = haloSegments + 1;
-        if (lr.positionCount != count) lr.positionCount = count;
-        for (int s = 0; s < count; s++)
-        {
-            float angle = (s / (float)haloSegments) * Mathf.PI * 2f;
-            Vector3 p = center + new Vector3(Mathf.Cos(angle) * radius, haloHeight, Mathf.Sin(angle) * radius);
-            lr.SetPosition(s, p);
-        }
     }
 
     Vector3 ToWorld(float x, float y)
@@ -308,11 +414,11 @@ public class GameStateReceiver : MonoBehaviour
             if (isDashing && !wasDashing) dashStretchTimers[index] = dashStretchDuration;
         }
 
-        // Halo de tir : uniquement pour les joueurs humains, déclenché au début du tir (front montant du kick).
+        // Anneau de tir : uniquement pour les joueurs humains, déclenché au début du tir (front montant du kick).
         if (isKicking && !wasKicking && humanPlayerSet != null && humanPlayerSet.Contains(index))
             haloTimers[index] = haloDuration;
 
-        UpdateHumanHalo(index, tr.position);
+        UpdateKickRing(index);
         UpdateHumanArrow(index, tr.position);
 
         if (kickPulseTimers[index] > 0f)
@@ -332,10 +438,11 @@ public class GameStateReceiver : MonoBehaviour
         else tr.localScale = baseScales[index];
     }
 
-    void UpdateHumanHalo(int index, Vector3 playerWorldPos)
+    void UpdateKickRing(int index)
     {
-        LineRenderer lr = haloRenderers[index];
-        if (lr == null) return;
+        Transform ringTr = kickRingTransforms[index];
+        if (ringTr == null) return;
+        Material mat = kickRingMaterials[index];
 
         if (haloTimers[index] > 0f)
         {
@@ -344,19 +451,17 @@ public class GameStateReceiver : MonoBehaviour
 
             float startRadius = RustPlayerRadius * worldScale * haloStartRadiusMultiplier;
             float endRadius = RustKickRadius * worldScale;
-            float radius = Mathf.Lerp(startRadius, endRadius, progress);
+            float radiusWorld = Mathf.Lerp(startRadius, endRadius, progress);
+            float radiusUv = radiusWorld / (endRadius * 2f);
 
-            Color c = haloColor;
-            c.a = haloColor.a * (1f - progress);
-            lr.startColor = c;
-            lr.endColor = c;
-
-            if (!lr.gameObject.activeSelf) lr.gameObject.SetActive(true);
-            UpdateHaloPoints(lr, playerWorldPos, radius);
+            if (!ringTr.gameObject.activeSelf) ringTr.gameObject.SetActive(true);
+            mat.SetFloat("_Radius", radiusUv);
+            mat.SetFloat("_Thickness", haloLineWidth);
+            mat.SetFloat("_Alpha", 1f - progress);
         }
-        else if (lr.gameObject.activeSelf)
+        else if (ringTr.gameObject.activeSelf)
         {
-            lr.gameObject.SetActive(false);
+            ringTr.gameObject.SetActive(false);
         }
     }
 
@@ -365,8 +470,9 @@ public class GameStateReceiver : MonoBehaviour
         Transform arrowTr = arrowTransforms[index];
         if (arrowTr == null) return;
 
+        float height = (playerHeights != null && index < playerHeights.Length) ? playerHeights[index] : 2f;
         float bob = Mathf.Sin(Time.time * arrowBobSpeed) * arrowBobAmplitude;
-        arrowTr.position = playerWorldPos + Vector3.up * (arrowHeightAbovePlayer + bob);
+        arrowTr.position = playerWorldPos + Vector3.up * (height + arrowHeightAbovePlayer + bob);
 
         Camera cam = Camera.main;
         if (cam != null)

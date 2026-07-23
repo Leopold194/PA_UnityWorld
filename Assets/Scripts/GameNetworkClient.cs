@@ -9,7 +9,7 @@ public class GameNetworkClient : MonoBehaviour
     public static GameNetworkClient Instance { get; private set; }
 
     public event Action<LobbyStateMsg> OnLobbyState;
-    public event Action OnGameStart;
+    public event Action<GameStartMsg> OnGameStart;
     public event Action<WorldState> OnWorldState;
 
     TcpClient client;
@@ -69,7 +69,8 @@ public class GameNetworkClient : MonoBehaviour
                 break;
 
             case "game_start":
-                mainThreadActions.Enqueue(() => OnGameStart?.Invoke());
+                var gameStart = JsonUtility.FromJson<GameStartMsg>(env.payload);
+                mainThreadActions.Enqueue(() => OnGameStart?.Invoke(gameStart));
                 break;
 
             case "world_state":

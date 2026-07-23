@@ -29,6 +29,12 @@ public class SelectTeamMsg
 }
 
 [Serializable]
+public class GameStartMsg
+{
+    public int[] slots; // client_id par slot (indice = index joueur), -1 si bot
+}
+
+[Serializable]
 public class PlayerInputMsg
 {
     public float vx, vy;       // stick gauche : déplacement

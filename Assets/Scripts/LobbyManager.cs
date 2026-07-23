@@ -87,7 +87,7 @@ public class LobbyManager : MonoBehaviour
         }
     }
 
-    void HandleGameStart()
+    void HandleGameStart(GameStartMsg msg)
     {
         Debug.Log("HandleGameStart: le jeu commence !");
         panelLobby.SetActive(false);
